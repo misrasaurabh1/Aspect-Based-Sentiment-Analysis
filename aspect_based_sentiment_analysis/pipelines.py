@@ -28,7 +28,7 @@ from .models import BertABSClassifier
 from .training import classifier_loss
 from .professors import Professor
 
-logger = logging.getLogger('absa.pipeline')
+logger = logging.getLogger("absa.pipeline")
 
 
 @dataclass
@@ -69,7 +69,7 @@ class _Pipeline(ABC):
         """
 
     @abstractmethod
-    def preprocess(self, text: str, aspects: List[str]) -> Task:
+    def preprocess(self, texts: List[str], aspects: List[List[str]]) -> Task:
         """
         Preprocess the raw task text and aspects into the task. Note that
         we may need to split a long text into smaller text chunks, called
@@ -78,7 +78,7 @@ class _Pipeline(ABC):
 
         Parameters
         ----------
-        text
+        texts
             This is the raw task text without rigorous length limit.
             The pipeline can contain the text_splitter, which splits a text
             into smaller chunks, called spans.
@@ -148,8 +148,7 @@ class _Pipeline(ABC):
 
     @staticmethod
     def postprocess(
-            task: Task,
-            batch_examples: Iterable[PredictedExample]
+        task: Task, batch_examples: Iterable[PredictedExample]
     ) -> CompletedTask:
         """
         Postprocess using the detailed information about the prediction.
@@ -171,10 +170,10 @@ class _Pipeline(ABC):
 
     @abstractmethod
     def evaluate(
-            self,
-            examples: Iterable[LabeledExample],
-            metric: tf.metrics.Metric,
-            batch_size: int
+        self,
+        examples: Iterable[LabeledExample],
+        metric: tf.metrics.Metric,
+        batch_size: int,
     ) -> tf.Tensor:
         """
         Evaluate the pre-trained model.
@@ -202,20 +201,27 @@ class Pipeline(_Pipeline):
     professor: Professor
     text_splitter: Callable[[str], List[str]] = None
 
-    def __call__(self, text: str, aspects: List[str]) -> CompletedTask:
-        task = self.preprocess(text, aspects)
-        predictions = self.transform(task.examples)
-        completed_task = self.postprocess(task, predictions)
+    def __call__(
+        self, texts: List[str], aspects: List[List[str]]
+    ) -> List[CompletedTask]:
+        tasks = self.preprocess(texts, aspects)
+        predictions = self.transform([ex for task in tasks for ex in task.examples])
+        completed_task = self.postprocess(tasks, predictions)
         return completed_task
 
-    def preprocess(self, text: str, aspects: List[str]) -> Task:
-        spans = self.text_splitter(text) if self.text_splitter else [text]
-        subtasks = OrderedDict()
-        for aspect in aspects:
-            examples = [Example(span, aspect) for span in spans]
-            subtasks[aspect] = SubTask(text, aspect, examples)
-        task = Task(text, aspects, subtasks)
-        return task
+    def preprocess(self, texts: List[str], aspects: List[List[str]]) -> List[Task]:
+        assert len(texts) == len(aspects)
+
+        tasks = []
+        for text, _aspects in zip(texts, aspects):
+            subtasks = OrderedDict()
+            for aspect in _aspects:
+                spans = self.text_splitter(text) if self.text_splitter else [text]
+                examples = [Example(span, aspect) for span in spans]
+                subtasks[aspect] = SubTask(text, aspect, examples)
+            task = Task(text, _aspects, subtasks)
+            tasks.append(task)
+        return tasks
 
     def transform(self, examples: Iterable[Example]) -> Iterable[PredictedExample]:
         tokenized_examples = self.tokenize(examples)
@@ -233,33 +239,33 @@ class Pipeline(_Pipeline):
             token_pairs,
             add_special_tokens=True,
             padding=True,
-            return_tensors='tf',
+            return_tensors="tf",
             return_attention_masks=True,
-            max_length=512
+            max_length=512,
         )
         batch = InputBatch(
-            token_ids=encoded['input_ids'],
-            attention_mask=encoded['attention_mask'],
-            token_type_ids=encoded['token_type_ids']
+            token_ids=encoded["input_ids"],
+            attention_mask=encoded["attention_mask"],
+            token_type_ids=encoded["token_type_ids"],
         )
         return batch
 
     def predict(self, input_batch: InputBatch) -> OutputBatch:
         # This implementation forces the model to return the detailed
         # output including hidden states and attentions.
-        with tf.GradientTape() as tape:
-            logits, hidden_states, attentions = self.model.call(
-                input_ids=input_batch.token_ids,
-                attention_mask=input_batch.attention_mask,
-                token_type_ids=input_batch.token_type_ids
-            )
-            # We assume that our predictions are correct. This is
-            # required to calculate the attention gradients for
-            # probing and exploratory purposes.
-            predictions = tf.argmax(logits, axis=-1)
-            labels = tf.one_hot(predictions, depth=3)
-            loss_value = classifier_loss(labels, logits)
-        attention_grads = tape.gradient(loss_value, attentions)
+        # with tf.GradientTape() as tape:
+        logits, hidden_states, attentions = self.model.call(
+            input_ids=input_batch.token_ids,
+            attention_mask=input_batch.attention_mask,
+            token_type_ids=input_batch.token_type_ids,
+        )
+        # We assume that our predictions are correct. This is
+        # required to calculate the attention gradients for
+        # probing and exploratory purposes.
+        predictions = tf.argmax(logits, axis=-1)
+        labels = tf.one_hot(predictions, depth=3)
+        loss_value = classifier_loss(labels, logits)
+        # attention_grads = tape.gradient(loss_value, attentions)
 
         # Compute the final prediction scores.
         scores = tf.nn.softmax(logits, axis=1)
@@ -272,52 +278,58 @@ class Pipeline(_Pipeline):
         stack = lambda x, order: tf.transpose(tf.stack(x), order)
         hidden_states = stack(hidden_states, [1, 0, 2, 3])
         attentions = stack(attentions, [1, 0, 2, 3, 4])
-        attention_grads = stack(attention_grads, [1, 0, 2, 3, 4])
+        # attention_grads = stack(
+        #     attentions, [1, 0, 2, 3, 4]
+        # )  # changed, shouldn't work now
         output_batch = OutputBatch(
             scores=scores,
             hidden_states=hidden_states,
             attentions=attentions,
-            attention_grads=attention_grads
+            attention_grads=attentions,
         )
         return output_batch
 
     def review(
-            self,
-            examples: Iterable[TokenizedExample],
-            output_batch: OutputBatch
+        self, examples: Iterable[TokenizedExample], output_batch: OutputBatch
     ) -> Iterable[PredictedExample]:
         return (self.professor.review(e, o) for e, o in zip(examples, output_batch))
 
     @staticmethod
     def postprocess(
-            task: Task,
-            batch_examples: Iterable[PredictedExample]
-    ) -> CompletedTask:
+        tasks: List[Task], batch_examples: Iterable[PredictedExample]
+    ) -> List[CompletedTask]:
         batch_examples = list(batch_examples)  # Materialize examples.
-        subtasks = OrderedDict()
-        for start, end in task.indices:
-            examples = batch_examples[start:end]
-            # Examples should have the same aspect (an implicit check).
-            aspect, = {e.aspect for e in examples}
-            scores = np.max([e.scores for e in examples], axis=0)
-            scores /= np.linalg.norm(scores, ord=1)
-            sentiment_id = np.argmax(scores).astype(int)
-            aspect_document = CompletedSubTask(
-                text=task.text,
-                aspect=aspect,
-                examples=examples,
-                sentiment=Sentiment(sentiment_id),
-                scores=list(scores)
-            )
-            subtasks[aspect] = aspect_document
-        task = CompletedTask(task.text, task.aspects, subtasks)
-        return task
+        completed_tasks = []
+        prev_end = 0
+        last_end = 0
+        for task in tasks:
+            subtasks = OrderedDict()
+            if len(task.indices) > 0:
+                for start, end in task.indices:
+                    examples = batch_examples[prev_end + start : prev_end + end]
+                    # Examples should have the same aspect (an implicit check).
+                    (aspect,) = {e.aspect for e in examples}
+                    scores = np.max([e.scores for e in examples], axis=0)
+                    scores /= np.linalg.norm(scores, ord=1)
+                    sentiment_id = np.argmax(scores).astype(int)
+                    aspect_document = CompletedSubTask(
+                        text=task.text,
+                        aspect=aspect,
+                        examples=examples,
+                        sentiment=Sentiment(sentiment_id),
+                        scores=list(scores),
+                    )
+                    subtasks[aspect] = aspect_document
+                    last_end = end
+                prev_end += last_end
+            completed_tasks.append(CompletedTask(task.text, task.aspects, subtasks))
+        return completed_tasks
 
     def evaluate(
-            self,
-            examples: Iterable[LabeledExample],
-            metric: tf.metrics.Metric,
-            batch_size: int
+        self,
+        examples: Iterable[LabeledExample],
+        metric: tf.metrics.Metric,
+        batch_size: int,
     ) -> tf.Tensor:
         batches = utils.batches(examples, batch_size)
         for batch in batches:
